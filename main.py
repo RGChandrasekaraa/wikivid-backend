@@ -26,7 +26,6 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    generate_video('https://en.wikipedia.org/wiki/Jesse_Olney')
     return {"message": "Hello World"}
 
 
