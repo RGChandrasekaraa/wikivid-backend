@@ -36,11 +36,25 @@ def bucket_exists(bucket_name):
         return False
 
 
-def upload_file_to_s3(local_file_path, bucket_name, s3_file_name):
-    """Upload a file to an S3 bucket"""
+def upload_fileobj_to_s3(file_obj, bucket_name, object_name, acl='private'):
+    """
+    Upload a file object to an S3 bucket
+
+    :param file_obj: File object to upload.
+    :param bucket_name: Bucket to upload to.
+    :param object_name: S3 object name. If not specified then file_obj name is used.
+    :param acl: String. The canned ACL to apply to the object.
+    :return: True if file was uploaded, else False.
+    """
     s3_client = boto3.client('s3')
     try:
-        s3_client.upload_file(local_file_path, bucket_name, s3_file_name)
+        s3_client.upload_fileobj(
+            file_obj,
+            bucket_name,
+            object_name,
+            ExtraArgs={'ACL': acl}
+        )
+        logging.info(f"File {object_name} uploaded to {bucket_name}")
         return True
     except ClientError as e:
         logging.error(e)
