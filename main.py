@@ -4,6 +4,7 @@ import secrets
 from engine.generator import generate_video
 from pydantic import BaseModel
 import asyncio
+from engine.db_operations import get_status_by_token
 from concurrent.futures import ProcessPoolExecutor
 
 
@@ -36,6 +37,13 @@ def generate_wikivid_token(length: int = 10) -> str:
     return token.upper()
 
 
+@app.get("/video-status/{token}")
+async def check_status(token: str):
+    # Check the status of the video generation request
+    # Return the status and video URL if available
+    return get_status_by_token(token)
+
+
 @app.get("/generate-token")
 async def generate_token():
     # Prefix the generated token with 'WV' for wikivid
@@ -46,9 +54,5 @@ async def generate_token():
 async def generate_video_req(background_tasks: BackgroundTasks, url: str = Form(...), token: str = Form(...)):
     print(f"URL received: {url}")
     print(f"Token received: {token}")
-    generate_video(url, token)
-    # background_tasks.add_task(generate_video, url, token)
-    # asyncio.create_task(generate_video(url, token))
-    # app.background_task(executor.submit(generate_video, url, token))
-    # background_tasks.add_task(executor.submit(generate_video, url, token))
-    return {"token": "WV" + generate_wikivid_token()}
+    background_tasks.add_task(generate_video, url, token)
+    return {"message": "Video generation started", "token": token}
