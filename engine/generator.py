@@ -7,7 +7,11 @@ import time
 import uuid
 from functools import partial
 from multiprocessing import Pool
-from .s3_utils import upload_file_to_s3, bucket_exists
+from .s3_utils import upload_fileobj_to_s3
+from .db_operations import create_request_entry, finalize_request, update_request_status
+from botocore.exceptions import ClientError
+import boto3
+
 
 from moviepy.editor import concatenate_videoclips, TextClip, AudioFileClip, CompositeVideoClip, vfx
 from gtts import gTTS
@@ -38,8 +42,9 @@ def get_audio_duration(audio_path):
         return 0
 
 
-def get_wikipedia_content(url):
+def get_wikipedia_content(token, url):
     try:
+        update_request_status(token, 'Fetching Wikipedia content...')
         user_agent = "wikiaudio/0.1 (https://github.com/rgchandrasekaraa/wikivid; rgchandrasekaraa@gmail.com)"
         wiki_wiki = wikipediaapi.Wikipedia(
             language='en', user_agent=user_agent)
@@ -48,19 +53,23 @@ def get_wikipedia_content(url):
         if not page.exists():
             logging.error("Page does not exist.")
             return ""
+        update_request_status(token, 'Wikipedia content fetched.')
         return page.text
     except Exception as e:
         logging.error(f"Error fetching Wikipedia content: {e}")
+        update_request_status(
+            token, 'FAILED: While Fetching Wikipedia content', str(e))
         return ""
 
 
-def summarize_text(text):
+def summarize_text(token, text):
     model_name = "facebook/bart-base"  # Using the base BART model
     tokenizer = BartTokenizer.from_pretrained(model_name)
     summarizer = pipeline(
         "summarization", model=model_name, tokenizer=tokenizer)
     summarized = ""
     try:
+        update_request_status(token, 'Summarizing text...')
         # Adjust max_length and min_length if needed
         max_length = 200
         min_length = 50
@@ -79,25 +88,31 @@ def summarize_text(text):
             summarized = summarizer(
                 text, max_length=max_length, min_length=min_length, do_sample=False)
             summarized = summarized[0]['summary_text']
+        update_request_status(token, 'Text summarized.')
         return summarized
     except Exception as e:
         logging.error(f"Error summarizing text: {e}")
+        update_request_status(token, 'FAILED: While Summarising Text.', str(e))
         return text
 
 
-def text_to_audio(text, language='en'):
+def text_to_audio(token, text, language='en'):
     try:
+        update_request_status(token, 'Generating Audio...')
         tts = gTTS(text=text, lang=language, slow=False)
         audio_path = f"{uuid.uuid4().hex}.mp3"
         tts.save(audio_path)
+        update_request_status(token, 'Audio Generated.')
         return audio_path
     except Exception as e:
         logging.error(f"Error converting text to audio: {e}")
+        update_request_status(token, 'FAILED: While Generating Audio.', str(e))
         return None
 
 
 def create_video(text, audio_path, token):
     try:
+        update_request_status(token, 'Creating video...')
         audio_duration = get_audio_duration(audio_path)
         wrapped_text = textwrap.fill(text, width=WRAP_WIDTH)
         total_text_height = FONT_SIZE * len(wrapped_text.split('\n'))
@@ -119,51 +134,61 @@ def create_video(text, audio_path, token):
         video_path = f"{token}_output_video.mp4"
         video.write_videofile(video_path, codec='libx264',
                               audio_codec='aac', fps=24)
+        update_request_status(token, 'Video created.')
         return video_path
     except Exception as e:
         logging.error(f"Error creating video: {e}")
+        update_request_status(token, 'FAILED: While Creating Video.', str(e))
         return None
 
 
 def generate_video(url: str, token: str):
     logging.info(f"Processing URL: {url}")
-    article_text = get_wikipedia_content(url)
+
+    # Create an entry in DynamoDB when the request is initiated
+    create_request_entry(token, url)
+
+    article_text = get_wikipedia_content(token, url)
     if not article_text:
-        logging.error("Failed to retrieve content. Exiting.")
         return
 
     logging.info("Content fetched. Summarizing...")
-    summarized_text = summarize_text(article_text)
+    summarized_text = summarize_text(token, article_text)
 
     logging.info("Text summarized. Generating audio...")
-    audio_path = text_to_audio(summarized_text)
+    audio_path = text_to_audio(token, summarized_text)
     if not audio_path:
-        logging.error("Failed to generate audio. Exiting.")
         return
 
+    # Create the video file
     logging.info("Audio generated. Creating video...")
     video_path = create_video(summarized_text, audio_path, token)
-    if video_path:
-        logging.info(f"Video has been saved to: {video_path}")
 
-        # Check if bucket exists and upload to S3
-        bucket_name = 'wikivid'  # Specify your bucket name here
-        if bucket_exists(bucket_name):
-            if upload_file_to_s3(video_path, bucket_name, os.path.basename(video_path)):
-                logging.info(
-                    f"Video {video_path} uploaded to S3 bucket {bucket_name}.")
-                # Remove the local video file after upload
-                os.remove(video_path)
-            else:
-                logging.error(
-                    f"Failed to upload video {video_path} to S3 bucket {bucket_name}.")
-        else:
-            logging.error(f"S3 bucket {bucket_name} does not exist.")
-
-        # Clean up audio file regardless of S3 upload success
+    # Delete the audio file immediately
+    # Clean up audio immediately after using it
+    if audio_path:
         os.remove(audio_path)
-    else:
-        logging.error("Failed to create video. Exiting.")
+
+    # If video creation failed, log error and exit
+    if not video_path:
+        return
+
+    # Upload video to S3 and clean up
+    try:
+        # Open the video file and pass the file object to the upload function
+        with open(video_path, 'rb') as video_file:
+            if upload_fileobj_to_s3(video_file, 'wikivid', f"{token}_output_video.mp4", acl='public-read'):
+                video_url = f"https://wikivid.s3-ap-southeast-2.amazonaws.com/{token}_output_video.mp4"
+                logging.info(f"Public URL of the video: {video_url}")
+                finalize_request(token, video_url)
+            else:
+                raise Exception("Failed to upload video to S3.")
+    except Exception as e:
+        raise Exception(f"Failed to upload video to S3: {e}")
+    finally:
+        # Delete the video file immediately after uploading
+        if os.path.exists(video_path):
+            os.remove(video_path)
 
 
 def parse_arguments():
